@@ -1,31 +1,37 @@
 #include <Arduino.h>
 #include <lvgl.h>
-#include <TFT_eSPI.h>
+#include <SPI.h>
 
 // Display configuration for ESP32-2432S028R
 #define SCREEN_WIDTH 240
 #define SCREEN_HEIGHT 320
-#define TFT_BL 21
 
-// Create TFT display object (used only for hardware initialization)
-TFT_eSPI tft = TFT_eSPI();
+// SPI and display pin definitions
+#define TFT_MISO 12
+#define TFT_MOSI 13
+#define TFT_SCLK 14
+#define TFT_CS   15
+#define TFT_DC   2
+#define TFT_RST  -1  // Not used
+#define TFT_BL   21
 
-// LVGL display buffer
+// ST7789 Commands
+#define ST7789_SWRESET    0x01
+#define ST7789_SLPOUT     0x11
+#define ST7789_COLMOD     0x3A
+#define ST7789_MADCTL     0x36
+#define ST7789_CASET      0x2A
+#define ST7789_RASET      0x2B
+#define ST7789_RAMWR      0x2C
+#define ST7789_DISPON     0x29
+
+// LVGL display buffer - double buffering for faster rendering
 static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf[SCREEN_WIDTH * 10]; // 10 lines buffer
+static lv_color_t buf1[SCREEN_WIDTH * 10]; // buffer for 10 lines
+static lv_color_t buf2[SCREEN_WIDTH * 10]; // second buffer
 
-// Display flushing callback for LVGL
-void display_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
-    uint32_t w = (area->x2 - area->x1 + 1);
-    uint32_t h = (area->y2 - area->y1 + 1);
-
-    tft.startWrite();
-    tft.setAddrWindow(area->x1, area->y1, w, h);
-    tft.pushColors((uint16_t*)&color_p->full, w * h, true);
-    tft.endWrite();
-
-    lv_disp_flush_ready(disp);
-}
+// SPI settings
+SPIClass *spi;
 
 // Global screen object
 lv_obj_t *screen;
@@ -34,6 +40,120 @@ lv_obj_t *screen;
 int demo_step = 0;
 unsigned long last_demo_time = 0;
 unsigned long step_start_time = 0;
+
+// Display control functions
+void writeCommand(uint8_t cmd) {
+    digitalWrite(TFT_DC, LOW);
+    digitalWrite(TFT_CS, LOW);
+    spi->transfer(cmd);
+    digitalWrite(TFT_CS, HIGH);
+}
+
+void writeData(uint8_t data) {
+    digitalWrite(TFT_DC, HIGH);
+    digitalWrite(TFT_CS, LOW);
+    spi->transfer(data);
+    digitalWrite(TFT_CS, HIGH);
+}
+
+void writeData16(uint16_t data) {
+    digitalWrite(TFT_DC, HIGH);
+    digitalWrite(TFT_CS, LOW);
+    spi->transfer(data >> 8);
+    spi->transfer(data & 0xFF);
+    digitalWrite(TFT_CS, HIGH);
+}
+
+void setAddrWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+    writeCommand(ST7789_CASET);
+    writeData16(x0);
+    writeData16(x1);
+    
+    writeCommand(ST7789_RASET);
+    writeData16(y0);
+    writeData16(y1);
+    
+    writeCommand(ST7789_RAMWR);
+}
+
+void initDisplay() {
+    Serial.println("Starting display initialization...");
+    
+    // Initialize SPI
+    spi = new SPIClass(VSPI);
+    spi->begin(TFT_SCLK, TFT_MISO, TFT_MOSI, TFT_CS);
+    spi->setFrequency(40000000); // 40MHz
+    spi->setDataMode(SPI_MODE0);
+    spi->setBitOrder(MSBFIRST);
+    
+    Serial.println("SPI initialized");
+    
+    // Initialize pins
+    pinMode(TFT_CS, OUTPUT);
+    pinMode(TFT_DC, OUTPUT);
+    pinMode(TFT_BL, OUTPUT);
+    
+    digitalWrite(TFT_CS, HIGH);
+    digitalWrite(TFT_DC, HIGH);
+    digitalWrite(TFT_BL, HIGH); // Turn on backlight
+    
+    Serial.println("Pins configured");
+    
+    // Add a small delay before starting display initialization
+    delay(100);
+    
+    // Reset display (software reset since RST pin is not connected)
+    writeCommand(ST7789_SWRESET);
+    delay(120);
+    
+    Serial.println("Display reset");
+    
+    // Exit sleep mode
+    writeCommand(ST7789_SLPOUT);
+    delay(120);
+    
+    // Set color mode to 16-bit (RGB565)
+    writeCommand(ST7789_COLMOD);
+    writeData(0x05);
+    
+    // Set rotation (Portrait mode, 240x320)
+    writeCommand(ST7789_MADCTL);
+    writeData(0xC0); // Portrait mode with flipped orientation
+    
+    // Turn on display
+    writeCommand(ST7789_DISPON);
+    delay(10);
+    
+    Serial.println("Display initialization complete");
+}
+
+// Display flushing callback for LVGL
+void display_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+    uint32_t w = (area->x2 - area->x1 + 1);
+    uint32_t h = (area->y2 - area->y1 + 1);
+
+    setAddrWindow(area->x1, area->y1, area->x2, area->y2);
+    
+    digitalWrite(TFT_DC, HIGH);
+    digitalWrite(TFT_CS, LOW);
+    
+    // Send pixel data
+    uint32_t pixels = w * h;
+    for(uint32_t i = 0; i < pixels; i++) {
+        uint16_t pixel = color_p[i].full;
+        spi->transfer(pixel >> 8);
+        spi->transfer(pixel & 0xFF);
+        
+        // Yield every 100 pixels to prevent watchdog
+        if(i % 100 == 0) {
+            yield();
+        }
+    }
+    
+    digitalWrite(TFT_CS, HIGH);
+    
+    lv_disp_flush_ready(disp);
+}
 
 // Color definitions (LVGL equivalents of TFT_eSPI colors)
 const lv_color_t COLOR_BLACK = LV_COLOR_MAKE(0, 0, 0);
@@ -75,7 +195,7 @@ void show_startup_message() {
     
     // Create driver info
     lv_obj_t *driver_label = lv_label_create(screen);
-    lv_label_set_text(driver_label, "Driver: ST7789");
+    lv_label_set_text(driver_label, "Driver: LVGL Native");
     lv_obj_set_style_text_color(driver_label, COLOR_WHITE, 0);
     lv_obj_set_pos(driver_label, 20, 120);
 }
@@ -85,19 +205,24 @@ void show_nested_rectangles() {
     static int current_rect = 0;
     static unsigned long last_rect_time = 0;
     static bool animation_complete = false;
+    static unsigned long last_step_time = 0;
     
-    // Initialize animation
-    if(current_rect == 0 && millis() - step_start_time < 100) {
-        fill_screen(COLOR_BLACK);
+    // Reset animation if we're in a new step cycle
+    if(step_start_time != last_step_time) {
+        current_rect = 0;
         animation_complete = false;
+        last_step_time = step_start_time;
+        fill_screen(COLOR_BLACK);
+        Serial.println("Resetting rectangles animation");
     }
     
     // Draw rectangles progressively
-    if(!animation_complete && millis() - last_rect_time > 200) {
+    if(!animation_complete && millis() - last_rect_time > 300) { // Slower animation - 300ms between rectangles
         lv_color_t colors[] = {COLOR_RED, COLOR_GREEN, COLOR_BLUE, COLOR_YELLOW, COLOR_CYAN, COLOR_MAGENTA};
         int numColors = sizeof(colors) / sizeof(colors[0]);
         
         if(current_rect < SCREEN_WIDTH/2) {
+            Serial.printf("Drawing rectangle %d\n", current_rect);
             // Create rectangle object
             lv_obj_t *rect = lv_obj_create(screen);
             lv_obj_remove_style_all(rect);
@@ -114,7 +239,7 @@ void show_nested_rectangles() {
             last_rect_time = millis();
         } else {
             animation_complete = true;
-            current_rect = 0; // Reset for next time
+            Serial.println("Rectangles animation complete");
         }
     }
 }
@@ -156,7 +281,7 @@ void show_display_info() {
     lv_obj_set_pos(height_label, 10, 150);
     
     lv_obj_t *driver_label = lv_label_create(screen);
-    lv_label_set_text(driver_label, "Driver: ST7789");
+    lv_label_set_text(driver_label, "Driver: LVGL Native");
     lv_obj_set_style_text_color(driver_label, COLOR_WHITE, 0);
     lv_obj_set_pos(driver_label, 10, 170);
 }
@@ -265,16 +390,39 @@ void show_orientation_pattern() {
 void setup() {
     // Initialize serial communication
     Serial.begin(115200);
-    Serial.println("ESP32-2432S028R Display Test");
+    Serial.println("ESP32-2432S028R Display Test - LVGL Native");
 
-    // Initialize backlight pin
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, HIGH); // Turn on backlight
-
-    // Initialize TFT display
-    tft.init();
-    tft.setRotation(2); // Portrait mode (240x320)
-    tft.fillScreen(TFT_BLACK);
+    // Initialize display hardware
+    initDisplay();
+    
+    // Test the display with a simple fill - bypassing LVGL
+    Serial.println("Testing display with red fill...");
+    setAddrWindow(0, 0, SCREEN_WIDTH-1, SCREEN_HEIGHT-1);
+    digitalWrite(TFT_DC, HIGH);
+    digitalWrite(TFT_CS, LOW);
+    
+    // Fill entire screen with red (RGB565: 0xF800)
+    for(int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
+        spi->transfer(0xF8);  // Red high byte
+        spi->transfer(0x00);  // Red low byte
+    }
+    digitalWrite(TFT_CS, HIGH);
+    
+    delay(2000); // Show red for 2 seconds
+    
+    // Now fill with blue (RGB565: 0x001F)
+    Serial.println("Testing display with blue fill...");
+    setAddrWindow(0, 0, SCREEN_WIDTH-1, SCREEN_HEIGHT-1);
+    digitalWrite(TFT_DC, HIGH);
+    digitalWrite(TFT_CS, LOW);
+    
+    for(int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
+        spi->transfer(0x00);  // Blue high byte
+        spi->transfer(0x1F);  // Blue low byte
+    }
+    digitalWrite(TFT_CS, HIGH);
+    
+    delay(2000); // Show blue for 2 seconds
 
     // Print display dimensions
     Serial.printf("Display dimensions: %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -282,8 +430,8 @@ void setup() {
     // Initialize LVGL
     lv_init();
 
-    // Initialize display buffer
-    lv_disp_draw_buf_init(&draw_buf, buf, NULL, SCREEN_WIDTH * 10);
+    // Initialize display buffer with double buffering
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, SCREEN_WIDTH * 10);
 
     // Initialize display driver
     static lv_disp_drv_t disp_drv;
@@ -314,45 +462,62 @@ void loop() {
     // Handle LVGL tasks
     lv_timer_handler();
     
+    // Debug output every 10 seconds
+    static unsigned long last_debug = 0;
+    if(current_time - last_debug > 10000) {
+        Serial.printf("Demo step: %d, Time since step start: %lu ms\n", demo_step, current_time - step_start_time);
+        last_debug = current_time;
+    }
+    
     // Demo sequence timing (matching original demo)
     switch(demo_step) {
         case 0: // Show startup message for 5 seconds
             if(current_time - step_start_time > 5000) {
+                Serial.println("Moving to step 1 - rectangles");
                 demo_step = 1;
                 step_start_time = current_time;
                 // Clear all objects for next step
                 lv_obj_clean(screen);
+                lv_obj_invalidate(screen); // Force redraw
             }
             break;
             
         case 1: // Show nested rectangles animation
             show_nested_rectangles();
-            if(current_time - step_start_time > 3000) { // Allow time for animation + 1 second delay
+            if(current_time - step_start_time > 5000) { // Allow time for animation + more viewing time
+                Serial.println("Moving to step 2 - display info");
                 demo_step = 2;
                 step_start_time = current_time;
                 lv_obj_clean(screen);
+                lv_obj_invalidate(screen); // Force redraw
             }
             break;
             
         case 2: // Show display information for 3 seconds
             if(current_time - step_start_time < 100) { // Only create once
                 show_display_info();
+                lv_obj_invalidate(screen); // Force redraw after creating objects
             }
             if(current_time - step_start_time > 3000) {
+                Serial.println("Moving to step 3 - orientation pattern");
                 demo_step = 3;
                 step_start_time = current_time;
                 lv_obj_clean(screen);
+                lv_obj_invalidate(screen); // Force redraw
             }
             break;
             
         case 3: // Show orientation test pattern for 3 seconds
             if(current_time - step_start_time < 100) { // Only create once
                 show_orientation_pattern();
+                lv_obj_invalidate(screen); // Force redraw after creating objects
             }
             if(current_time - step_start_time > 3000) {
+                Serial.println("Looping back to step 1 - rectangles");
                 demo_step = 1; // Loop back to rectangles animation
                 step_start_time = current_time;
                 lv_obj_clean(screen);
+                lv_obj_invalidate(screen); // Force redraw
             }
             break;
     }
