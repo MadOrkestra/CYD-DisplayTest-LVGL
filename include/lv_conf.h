@@ -17,7 +17,10 @@
 #ifndef LV_CONF_H
 #define LV_CONF_H
 
+/* Skip C headers when included from assembly (e.g. lv_blend_helium.S) */
+#ifndef __ASSEMBLY__
 #include <stdint.h>
+#endif
 
 /*====================
    COLOR SETTINGS

@@ -25,16 +25,22 @@
 #define ST7789_RAMWR      0x2C
 #define ST7789_DISPON     0x29
 
-// LVGL display buffer - double buffering for faster rendering
-static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf1[SCREEN_WIDTH * 10]; // buffer for 10 lines
-static lv_color_t buf2[SCREEN_WIDTH * 10]; // second buffer
+// LVGL 9 display buffers - size in bytes (RGB565 = 2 bytes per pixel)
+#define DRAW_BUF_PIXELS  (SCREEN_WIDTH * 10)
+#define DRAW_BUF_BYTES   (DRAW_BUF_PIXELS * 2)
+static uint8_t buf1[DRAW_BUF_BYTES];
+static uint8_t buf2[DRAW_BUF_BYTES];
 
 // SPI settings
 SPIClass *spi;
 
 // Global screen object
 lv_obj_t *screen;
+
+// LVGL 9: provide tick from Arduino millis() so timers/refresh work
+static uint32_t lvgl_tick_get_cb(void) {
+    return (uint32_t)millis();
+}
 
 // Demo state variables
 int demo_step = 0;
@@ -127,8 +133,8 @@ void initDisplay() {
     Serial.println("Display initialization complete");
 }
 
-// Display flushing callback for LVGL
-void display_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+// Display flushing callback for LVGL 9 (px_map is uint8_t* RGB565 data)
+void display_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
 
@@ -137,14 +143,13 @@ void display_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
     digitalWrite(TFT_DC, HIGH);
     digitalWrite(TFT_CS, LOW);
     
-    // Send pixel data
+    uint16_t *color_p = (uint16_t *)px_map;
     uint32_t pixels = w * h;
     for(uint32_t i = 0; i < pixels; i++) {
-        uint16_t pixel = color_p[i].full;
+        uint16_t pixel = color_p[i];
         spi->transfer(pixel >> 8);
         spi->transfer(pixel & 0xFF);
         
-        // Yield every 100 pixels to prevent watchdog
         if(i % 100 == 0) {
             yield();
         }
@@ -152,7 +157,7 @@ void display_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
     
     digitalWrite(TFT_CS, HIGH);
     
-    lv_disp_flush_ready(disp);
+    lv_display_flush_ready(disp);
 }
 
 // Color definitions (LVGL equivalents of TFT_eSPI colors)
@@ -430,21 +435,17 @@ void setup() {
     // Initialize LVGL
     lv_init();
 
-    // Initialize display buffer with double buffering
-    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, SCREEN_WIDTH * 10);
+    // LVGL 9: set tick callback so timers and display refresh run (otherwise screen never updates)
+    lv_tick_set_cb(lvgl_tick_get_cb);
 
-    // Initialize display driver
-    static lv_disp_drv_t disp_drv;
-    lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = SCREEN_WIDTH;
-    disp_drv.ver_res = SCREEN_HEIGHT;
-    disp_drv.flush_cb = display_flush;
-    disp_drv.draw_buf = &draw_buf;
-    lv_disp_drv_register(&disp_drv);
+    // LVGL 9: create display and set buffers + flush callback
+    lv_display_t *disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_display_set_buffers(disp, buf1, buf2, DRAW_BUF_BYTES, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(disp, display_flush);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
 
-    // Create main screen
-    screen = lv_obj_create(NULL);
-    lv_scr_load(screen);
+    // Get the default active screen (created with the display)
+    screen = lv_display_get_screen_active(disp);
 
     // Show startup message (equivalent to original setup display)
     show_startup_message();
