@@ -26,7 +26,10 @@
 #define ST7789_DISPON     0x29
 
 // LVGL 9 display buffers - size in bytes (RGB565 = 2 bytes per pixel)
-#define DRAW_BUF_PIXELS  (SCREEN_WIDTH * 10)
+// Larger buffer = fewer bands per frame = smoother updates. Kept to 40 lines to fit in ESP32
+// internal DRAM (~38KB for both buffers). 40 lines = 8 bands per frame (vs 32 with 10 lines).
+#define DRAW_BUF_HEIGHT  40
+#define DRAW_BUF_PIXELS  (SCREEN_WIDTH * DRAW_BUF_HEIGHT)
 #define DRAW_BUF_BYTES   (DRAW_BUF_PIXELS * 2)
 static uint8_t buf1[DRAW_BUF_BYTES];
 static uint8_t buf2[DRAW_BUF_BYTES];
@@ -134,29 +137,28 @@ void initDisplay() {
 }
 
 // Display flushing callback for LVGL 9 (px_map is uint8_t* RGB565 data)
+// Send in chunks via bulk SPI (faster than byte-by-byte). Use temp buffer so
+// SPI transfer (which may overwrite the buffer with received data) doesn't corrupt LVGL's buffer.
+#define FLUSH_CHUNK_SIZE  2048
 void display_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
+    uint32_t len = w * h * 2;  // bytes (RGB565)
 
     setAddrWindow(area->x1, area->y1, area->x2, area->y2);
-    
+
     digitalWrite(TFT_DC, HIGH);
     digitalWrite(TFT_CS, LOW);
-    
-    uint16_t *color_p = (uint16_t *)px_map;
-    uint32_t pixels = w * h;
-    for(uint32_t i = 0; i < pixels; i++) {
-        uint16_t pixel = color_p[i];
-        spi->transfer(pixel >> 8);
-        spi->transfer(pixel & 0xFF);
-        
-        if(i % 100 == 0) {
-            yield();
-        }
+
+    uint8_t chunk[FLUSH_CHUNK_SIZE];
+    for (uint32_t i = 0; i < len; i += FLUSH_CHUNK_SIZE) {
+        uint32_t n = (len - i) < FLUSH_CHUNK_SIZE ? (len - i) : FLUSH_CHUNK_SIZE;
+        memcpy(chunk, px_map + i, n);
+        spi->transfer(chunk, n);
     }
-    
+
     digitalWrite(TFT_CS, HIGH);
-    
+
     lv_display_flush_ready(disp);
 }
 
